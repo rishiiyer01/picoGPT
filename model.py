@@ -8,7 +8,7 @@ from transformers import GPT2LMHeadModel
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #RoPE 
 class RotaryPositionEmbedding(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int = 2048):
+    def __init__(self, dim: int, max_seq_len: int = 65536):
         """
         Initialize Rotary Position Embedding
         
@@ -184,13 +184,13 @@ class ffMoE(nn.Module):
 #PicoGPT is a transformer with multi-latent attention (deepseek version), simple feedforward expert parallel MoEs and parameter sharing across 4 blocks
 #we do NOT use long-short sliding windows or hybridization on this version
 class PicoGPT(nn.Module):
-    def __init__(self, in_channels, hidden_dim, num_blocks,vocab=50257):
+    def __init__(self, hidden_dim, num_blocks,vocab=50257):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_blocks = num_blocks
         
         #embedding from tokens
-        self.embd=nn.Embedding(vocab,768)
+        self.embd=nn.Embedding(vocab,hidden_dim)
         #self.initial_proj = nn.Linear(in_channels, hidden_dim)  
         
         
@@ -208,9 +208,10 @@ class PicoGPT(nn.Module):
         
      
     def forward(self, x):
-        #x is already tokenized in shape B,S,1
+        #x is already tokenized in shape B,S,1 (squeezed), B=1 from dataloader due to flattening for flex attention
         tokens=x
-        x=self.embd(x)
+        x=self.embd(x).unsqueeze(0)
+        
         
         for block in self.blocks:
             x = block(x,tokens)
@@ -262,7 +263,7 @@ class FeedForward(nn.Module):
 #might add moe for keys and output
 #theoretically because the qkv is low rank computed, it might be beneficial to use moes for each linear layer
 class MultiLatentAttention(nn.Module):
-    def __init__(self,hidden_dim,num_heads=8,low_rank=2,block_size=128,max_seq_len=2048):
+    def __init__(self,hidden_dim,num_heads=12,low_rank=2,block_size=128,max_seq_len=1024):
         super().__init__()
         self.num_heads=num_heads
         self.head_dim=hidden_dim//num_heads
@@ -282,10 +283,11 @@ class MultiLatentAttention(nn.Module):
         self.o_proj = nn.Linear(hidden_dim, hidden_dim)
         self.rope=RotaryPositionEmbedding(self.head_dim)
         self.scale = (2*self.head_dim) ** -0.5
+        self.world_size=torch.distributed.get_world_size()
         
     ##This method implements a causal mask with document boudnaries such that a batch of sequences is processed all at once
     ##in the format required by torch flex attention for dramatic speedups, is faster than scaled DPA and FA2 more often than not
-    def create_block_masks(self, input_seq: Tensor, sliding_window_num_blocks: int = None):
+    def create_block_masks(self, input_seq, sliding_window_num_blocks: int = None):
         # Track document boundaries using a special token (e.g. EOS token)
         EOS_TOKEN = 50256  # Adjust based on your tokenizer
         docs = (input_seq == EOS_TOKEN).cumsum(0)
@@ -313,7 +315,7 @@ class MultiLatentAttention(nn.Module):
             return causal_mask & document_mask
 
         # Convert dense masks to BlockMask format
-        def dense_to_ordered(dense_mask: Tensor):
+        def dense_to_ordered(dense_mask):
             num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
             indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
@@ -322,7 +324,7 @@ class MultiLatentAttention(nn.Module):
         full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
 
         # Calculate sliding window based on max sequence length
-        default_window = self.max_seq_len // self.block_size
+        default_window = self.max_seq_len*self.world_size*16 // self.block_size
         sliding_window = min(sliding_window_num_blocks or default_window, default_window)
         
         return BlockMask.from_kv_blocks(
@@ -340,7 +342,7 @@ class MultiLatentAttention(nn.Module):
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         
         # Create block masks with document boundary handling
-        block_mask = self.create_block_masks(input_seq=token_seq, sliding_window_num_blocks)
+        block_mask = self.create_block_masks(input_seq=token_seq, sliding_window_num_blocks=None)
         
         # query projections
         qd=self.qd_proj(x) #B,N,low_rank_dim
@@ -368,6 +370,10 @@ class MultiLatentAttention(nn.Module):
         x = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
         x = x.transpose(1, 2).reshape(B, N, -1)
         return x
+
+
+
+
 
 
 
