@@ -262,6 +262,7 @@ class FeedForward(nn.Module):
 #flex attention
 #might add moe for keys and output
 #theoretically because the qkv is low rank computed, it might be beneficial to use moes for each linear layer
+#for flex attention compiled, we need even lower rank for q and k
 class MultiLatentAttention(nn.Module):
     def __init__(self,hidden_dim,num_heads=12,low_rank=2,block_size=128,max_seq_len=1024):
         super().__init__()
@@ -272,21 +273,27 @@ class MultiLatentAttention(nn.Module):
         #assert hidden_dim//num_heads
         #downproj for q
         self.qd_proj=nn.Linear(hidden_dim,hidden_dim//low_rank)
-        self.qu_proj=nn.Linear(hidden_dim//low_rank,hidden_dim)
-        self.qr_proj=nn.Linear(hidden_dim,self.head_dim)
+        self.qu_proj=nn.Linear(hidden_dim//low_rank,hidden_dim//2)
+        #self.qr_proj=nn.Linear(hidden_dim,self.head_dim) #original
+        self.qr_proj=nn.Linear(hidden_dim,self.head_dim//2)
         #shared downproj for k,v
         self.kvd=nn.Linear(hidden_dim,hidden_dim//low_rank)
         self.v_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim)
-        self.k_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim)
-        self.kr_proj=nn.Linear(hidden_dim,self.head_dim)
+        self.k_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim//2)
+        #self.kr_proj=nn.Linear(hidden_dim,self.head_dim) #original
+        self.kr_proj=nn.Linear(hidden_dim,self.head_dim//2)
         #output proj
         self.o_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.rope=RotaryPositionEmbedding(self.head_dim)
-        self.scale = (2*self.head_dim) ** -0.5
+        #self.rope=RotaryPositionEmbedding(self.head_dim) #orignal
+        self.rope=RotaryPositionEmbedding(self.head_dim//2)
+        #self.scale = (2*self.head_dim) ** -0.5 #original
+        self.scale=(self.head_dim)**-0.5
+        
         self.world_size=torch.distributed.get_world_size()
         
     ##This method implements a causal mask with document boudnaries such that a batch of sequences is processed all at once
     ##in the format required by torch flex attention for dramatic speedups, is faster than scaled DPA and FA2 more often than not
+    #especially with this document masking approach
     def create_block_masks(self, input_seq, sliding_window_num_blocks: int = None):
         # Track document boundaries using a special token (e.g. EOS token)
         EOS_TOKEN = 50256  # Adjust based on your tokenizer
@@ -346,12 +353,12 @@ class MultiLatentAttention(nn.Module):
         
         # query projections
         qd=self.qd_proj(x) #B,N,low_rank_dim
-        qr=self.qr_proj(x).unsqueeze(2)# B,N,1,head_dim
-        qr=qr.expand(-1,-1,self.num_heads,-1).permute(0,2,1,3) #B,num_heads,seq_len,head_dim
+        qr=self.qr_proj(x).unsqueeze(2)# B,N,1,head_dim/2
+        qr=qr.expand(-1,-1,self.num_heads,-1).permute(0,2,1,3) #B,num_heads,seq_len,head_dim//2
         qr=self.rope(qr)
         q=self.qu_proj(qd) #B,N,dim
-        q=q.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
-        q=torch.cat((q,qr),dim=-1) #B,num_heads,seq_len,head_dim*2
+        q=q.reshape(B,N,self.num_heads,self.head_dim//2).permute(0,2,1,3)
+        q=torch.cat((q,qr),dim=-1) #B,num_heads,seq_len,head_dim
         
         #keys
         low_rank_kv=self.kvd(x)
@@ -359,14 +366,14 @@ class MultiLatentAttention(nn.Module):
         kr=self.kr_proj(x).unsqueeze(2)
         kr=kr.expand(-1,-1,self.num_heads,-1).permute(0,2,1,3)
         kr=self.rope(kr)
-        k= k.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
-        k=torch.cat((k,kr),dim=-1) #B,num_heads,seq_len,head_dim*2
+        k= k.reshape(B,N,self.num_heads,self.head_dim//2).permute(0,2,1,3)
+        k=torch.cat((k,kr),dim=-1) #B,num_heads,seq_len,head_dim
         
         #values
         ### the point of doing low rank is not just parameter count reduction, but also kv cache size reduction
         v=self.v_up_proj(low_rank_kv) 
         v=v.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
-        
+        #print(q.shape,k.shape,v.shape)
         x = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
         x = x.transpose(1, 2).reshape(B, N, -1)
         return x

@@ -11,7 +11,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 #I almost wanted to use FSDP with no_shard, but DDP is actually faster even though it is older
 from model import PicoGPT
 
-
+import os
+os.environ['CC'] = 'gcc'
 assert torch.cuda.is_available(), "CUDA is required for training"
 
 
@@ -158,7 +159,7 @@ def main():
         num_blocks=config.num_blocks,
         vocab=config.vocab_size
     ).to(device)
-    #model=torch.compile(model)
+    model=torch.compile(model)
     
     if world_size > 1:
         model = DDP(model, device_ids=[device])
