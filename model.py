@@ -194,12 +194,12 @@ class PicoGPT(nn.Module):
         #self.initial_proj = nn.Linear(in_channels, hidden_dim)  
         
         
-        #self.blocks = nn.ModuleList([
-        #    Block(hidden_dim) for _ in range(num_blocks)
-        #])
-        unique_blocks = [Block(hidden_dim) for _ in range(num_blocks//2)] #repeating twice
+        self.blocks = nn.ModuleList([
+            Block(hidden_dim) for _ in range(num_blocks)
+        ])
+        #unique_blocks = [Block(hidden_dim) for _ in range(num_blocks//2)] #repeating twice
         #Univeral Transformer Parameter Sharing
-        self.blocks = nn.ModuleList(unique_blocks*2)
+        #self.blocks = nn.ModuleList(unique_blocks*2)
         
         
         
@@ -229,7 +229,8 @@ class Block(nn.Module):
         super().__init__()
         #self.attention =SHAttention(8,hidden_dim,num_heads=8)
         self.attention=MultiLatentAttention(hidden_dim)
-        self.ff = ffMoE(8,hidden_dim) #num experts, hidden_size
+        #self.ff = ffMoE(8,hidden_dim) #num experts, hidden_size
+        self.ff=FeedForward(hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim) #perhaps rms norm is better here, llama uses rms_norm
         self.norm2 = nn.LayerNorm(hidden_dim)
         
@@ -273,21 +274,21 @@ class MultiLatentAttention(nn.Module):
         #assert hidden_dim//num_heads
         #downproj for q
         self.qd_proj=nn.Linear(hidden_dim,hidden_dim//low_rank)
-        self.qu_proj=nn.Linear(hidden_dim//low_rank,hidden_dim//2)
+        self.qu_proj=nn.Linear(hidden_dim//low_rank,hidden_dim)
         #self.qr_proj=nn.Linear(hidden_dim,self.head_dim) #original
-        self.qr_proj=nn.Linear(hidden_dim,self.head_dim//2)
+        self.qr_proj=nn.Linear(hidden_dim,self.head_dim)
         #shared downproj for k,v
         self.kvd=nn.Linear(hidden_dim,hidden_dim//low_rank)
-        self.v_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim)
-        self.k_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim//2)
+        self.v_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim*2)
+        self.k_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim)
         #self.kr_proj=nn.Linear(hidden_dim,self.head_dim) #original
-        self.kr_proj=nn.Linear(hidden_dim,self.head_dim//2)
+        self.kr_proj=nn.Linear(hidden_dim,self.head_dim)
         #output proj
-        self.o_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.o_proj = nn.Linear(hidden_dim*2, hidden_dim)
         #self.rope=RotaryPositionEmbedding(self.head_dim) #orignal
-        self.rope=RotaryPositionEmbedding(self.head_dim//2)
-        #self.scale = (2*self.head_dim) ** -0.5 #original
-        self.scale=(self.head_dim)**-0.5
+        self.rope=RotaryPositionEmbedding(self.head_dim)
+        self.scale = (2*self.head_dim) ** -0.5 #original
+        #self.scale=(self.head_dim)**-0.5
         
         self.world_size=torch.distributed.get_world_size()
         
@@ -331,7 +332,8 @@ class MultiLatentAttention(nn.Module):
         full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
 
         # Calculate sliding window based on max sequence length
-        default_window = self.max_seq_len*self.world_size*16 // self.block_size
+        #default_window = self.max_seq_len*self.world_size*64 // self.block_size
+        default_window=1792//self.block_size
         sliding_window = min(sliding_window_num_blocks or default_window, default_window)
         
         return BlockMask.from_kv_blocks(
@@ -357,7 +359,7 @@ class MultiLatentAttention(nn.Module):
         qr=qr.expand(-1,-1,self.num_heads,-1).permute(0,2,1,3) #B,num_heads,seq_len,head_dim//2
         qr=self.rope(qr)
         q=self.qu_proj(qd) #B,N,dim
-        q=q.reshape(B,N,self.num_heads,self.head_dim//2).permute(0,2,1,3)
+        q=q.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
         q=torch.cat((q,qr),dim=-1) #B,num_heads,seq_len,head_dim
         
         #keys
@@ -366,23 +368,17 @@ class MultiLatentAttention(nn.Module):
         kr=self.kr_proj(x).unsqueeze(2)
         kr=kr.expand(-1,-1,self.num_heads,-1).permute(0,2,1,3)
         kr=self.rope(kr)
-        k= k.reshape(B,N,self.num_heads,self.head_dim//2).permute(0,2,1,3)
+        k= k.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
         k=torch.cat((k,kr),dim=-1) #B,num_heads,seq_len,head_dim
         
         #values
         ### the point of doing low rank is not just parameter count reduction, but also kv cache size reduction
         v=self.v_up_proj(low_rank_kv) 
-        v=v.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
-        #print(q.shape,k.shape,v.shape)
+        v=v.reshape(B,N,self.num_heads,(self.head_dim*2)).permute(0,2,1,3)
+        
         x = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
         x = x.transpose(1, 2).reshape(B, N, -1)
+
+        x=self.o_proj(x)
         return x
-
-
-
-
-
-
-
-
 

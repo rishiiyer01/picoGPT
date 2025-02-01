@@ -10,8 +10,12 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 #I almost wanted to use FSDP with no_shard, but DDP is actually faster even though it is older
 from model import PicoGPT
+from torch.cuda.amp import autocast
+
+
 
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ['CC'] = 'gcc'
 assert torch.cuda.is_available(), "CUDA is required for training"
 
@@ -24,18 +28,18 @@ assert torch.cuda.is_available(), "CUDA is required for training"
 class TrainingConfig:
     # Model parameters
     hidden_dim: int = 768
-    num_blocks: int = 16
+    num_blocks: int = 12
     vocab_size: int = 50257 #could potentially expand vocab to nearest power of 2 for marginal efficiency gain
     
     # Training parameters
     train_files: str = "data/fineweb10B/train/*.bin"  # Path pattern to training data
     val_files: str = "data/fineweb10B/val/*.bin"      # Path pattern to validation data
-    batch_size: int = 16* 1024 #*8            # Batch size in tokens remember to switch back to 64 
-    learning_rate: float = 1e-4
+    batch_size: int = 32* 1024 *8            # Batch size in tokens remember to switch back to 64 
+    learning_rate: float = 2e-4 #different learning rates for different params might need to be added for efficiency
     num_epochs: int = 1
     val_interval: int = 200                # Validate every N steps
     val_tokens: int = 10_000               # Number of validation tokens to use
-    max_seq_len: int = 16*1024 #*8             # maximum sequence length for flex attention
+    max_seq_len: int = 32*1024 *8             # maximum sequence length for flex attention
     
     # Logging and checkpointing
     save_dir: str = "checkpoints"
@@ -51,6 +55,7 @@ def setup_distributed():
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(backend="nccl")
+    torch.set_float32_matmul_precision('high')
     
     #if world_size > 1:
         
@@ -159,7 +164,7 @@ def main():
         num_blocks=config.num_blocks,
         vocab=config.vocab_size
     ).to(device)
-    model=torch.compile(model)
+    model=torch.compile(model,mode="reduce-overhead")
     
     if world_size > 1:
         model = DDP(model, device_ids=[device])
@@ -197,6 +202,8 @@ def main():
         try:
             inputs, targets = next(train_loader)
             
+            
+            
             logits = model(inputs)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
             
@@ -225,6 +232,9 @@ def main():
             step += 1
             
         except StopIteration:
+            if rank == 0:
+                save_checkpoint(model, optimizer, step, loss.item(), config, run_id)
+            
             break
             
     
