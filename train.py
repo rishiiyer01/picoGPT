@@ -35,7 +35,7 @@ class TrainingConfig:
     train_files: str = "data/fineweb10B/train/*.bin"  # Path pattern to training data
     val_files: str = "data/fineweb10B/val/*.bin"      # Path pattern to validation data
     batch_size: int = 32* 1024 *8            # Batch size in tokens remember to switch back to 64 
-    learning_rate: float = 2e-4 #different learning rates for different params might need to be added for efficiency
+    learning_rate: float = 3e-4 #different learning rates for different params might need to be added for efficiency
     num_epochs: int = 1
     val_interval: int = 200                # Validate every N steps
     val_tokens: int = 10_000               # Number of validation tokens to use

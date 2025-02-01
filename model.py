@@ -6,6 +6,8 @@ import math
 import torch.distributed as dist
 from transformers import GPT2LMHeadModel
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+#create_block_mask = torch.compile(create_block_mask, dynamic=False)
 #RoPE 
 class RotaryPositionEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 65536):
@@ -211,11 +213,13 @@ class PicoGPT(nn.Module):
         #x is already tokenized in shape B,S,1 (squeezed), B=1 from dataloader due to flattening for flex attention
         tokens=x
         x=self.embd(x).unsqueeze(0)
-        
+        #layer norm before blocks, empirical improvement
+        x=F.rms_norm(x, (x.size(-1),))
         
         for block in self.blocks:
             x = block(x,tokens)
-
+        #layer norm after blocks, standard
+        x=F.rms_norm(x, (x.size(-1),))
         logits=self.out_proj(x)
         
         return logits #b,h*w,vocab
@@ -265,7 +269,7 @@ class FeedForward(nn.Module):
 #theoretically because the qkv is low rank computed, it might be beneficial to use moes for each linear layer
 #for flex attention compiled, we need even lower rank for q and k
 class MultiLatentAttention(nn.Module):
-    def __init__(self,hidden_dim,num_heads=12,low_rank=2,block_size=128,max_seq_len=1024):
+    def __init__(self,hidden_dim,num_heads=12,low_rank=4,block_size=128,max_seq_len=1024):
         super().__init__()
         self.num_heads=num_heads
         self.head_dim=hidden_dim//num_heads
@@ -273,77 +277,26 @@ class MultiLatentAttention(nn.Module):
         self.max_seq_len=max_seq_len
         #assert hidden_dim//num_heads
         #downproj for q
-        self.qd_proj=nn.Linear(hidden_dim,hidden_dim//low_rank)
-        self.qu_proj=nn.Linear(hidden_dim//low_rank,hidden_dim)
+        self.qd_proj=nn.Linear(hidden_dim,hidden_dim//2) #for queries we only compress by factor of 2 instead of 4
+        self.qu_proj=nn.Linear(hidden_dim//2,hidden_dim*3)
         #self.qr_proj=nn.Linear(hidden_dim,self.head_dim) #original
         self.qr_proj=nn.Linear(hidden_dim,self.head_dim)
         #shared downproj for k,v
         self.kvd=nn.Linear(hidden_dim,hidden_dim//low_rank)
-        self.v_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim*2)
-        self.k_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim)
+        self.v_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim*4)
+        self.k_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim*3)
         #self.kr_proj=nn.Linear(hidden_dim,self.head_dim) #original
         self.kr_proj=nn.Linear(hidden_dim,self.head_dim)
         #output proj
-        self.o_proj = nn.Linear(hidden_dim*2, hidden_dim)
+        self.o_proj = nn.Linear(hidden_dim*4, hidden_dim)
         #self.rope=RotaryPositionEmbedding(self.head_dim) #orignal
         self.rope=RotaryPositionEmbedding(self.head_dim)
-        self.scale = (2*self.head_dim) ** -0.5 #original
+        self.scale = (4*self.head_dim) ** -0.5 #original was 2, now we are doing larger attention at 3/2
         #self.scale=(self.head_dim)**-0.5
         
         self.world_size=torch.distributed.get_world_size()
         
-    ##This method implements a causal mask with document boudnaries such that a batch of sequences is processed all at once
-    ##in the format required by torch flex attention for dramatic speedups, is faster than scaled DPA and FA2 more often than not
-    #especially with this document masking approach
-    def create_block_masks(self, input_seq, sliding_window_num_blocks: int = None):
-        # Track document boundaries using a special token (e.g. EOS token)
-        EOS_TOKEN = 50256  # Adjust based on your tokenizer
-        docs = (input_seq == EOS_TOKEN).cumsum(0)
-        
-        NUM_BLOCKS = (input_seq.size(0) + self.block_size - 1) // self.block_size
-        block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
-        
-        # Create causal block masks
-        any_causal_bm = block_idx[:, None] >= block_idx
-        all_causal_bm = block_idx[:, None] > block_idx
-        
-        # Document boundary masking
-        docs_low = docs.view(-1, self.block_size)[:, 0].contiguous()
-        docs_high = docs.view(-1, self.block_size)[:, -1].contiguous()
-        any_document_bm = (docs_low[:, None] <= docs_high) & (docs_high[:, None] >= docs_low)
-        all_document_bm = (docs_low[:, None] == docs_high) & (docs_high[:, None] == docs_low)
-        
-        # Combine causal and document masks
-        any_bm = any_causal_bm & any_document_bm
-        all_bm = all_causal_bm & all_document_bm
-
-        def document_causal(b, h, q_idx, kv_idx):
-            causal_mask = q_idx >= kv_idx
-            document_mask = docs[q_idx] == docs[kv_idx]
-            return causal_mask & document_mask
-
-        # Convert dense masks to BlockMask format
-        def dense_to_ordered(dense_mask):
-            num_blocks = dense_mask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_mask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
-            return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
-            
-        partial_kv_num_blocks, partial_kv_indices = dense_to_ordered(any_bm & ~all_bm)
-        full_kv_num_blocks, full_kv_indices = dense_to_ordered(all_bm)
-
-        # Calculate sliding window based on max sequence length
-        #default_window = self.max_seq_len*self.world_size*64 // self.block_size
-        default_window=1792//self.block_size
-        sliding_window = min(sliding_window_num_blocks or default_window, default_window)
-        
-        return BlockMask.from_kv_blocks(
-            torch.clamp_max(partial_kv_num_blocks, torch.clamp_min(sliding_window - full_kv_num_blocks, 1)),
-            partial_kv_indices,
-            torch.clamp_max(full_kv_num_blocks, sliding_window - 1),
-            full_kv_indices,
-            BLOCK_SIZE=self.block_size,
-            mask_mod=document_causal,
-        )
+    
 
     def forward(self, x,token_seq):
         #layer norm prior to input
@@ -351,7 +304,7 @@ class MultiLatentAttention(nn.Module):
         assert B == 1, "Must use batch size = 1 for FlexAttention"
         
         # Create block masks with document boundary handling
-        block_mask = self.create_block_masks(input_seq=token_seq, sliding_window_num_blocks=None)
+        #block_mask = self.create_block_masks(input_seq=token_seq, sliding_window_num_blocks=None)
         
         # query projections
         qd=self.qd_proj(x) #B,N,low_rank_dim
@@ -359,26 +312,39 @@ class MultiLatentAttention(nn.Module):
         qr=qr.expand(-1,-1,self.num_heads,-1).permute(0,2,1,3) #B,num_heads,seq_len,head_dim//2
         qr=self.rope(qr)
         q=self.qu_proj(qd) #B,N,dim
-        q=q.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
+        q=q.reshape(B,N,self.num_heads,self.head_dim*3).permute(0,2,1,3)
         q=torch.cat((q,qr),dim=-1) #B,num_heads,seq_len,head_dim
         
+        
         #keys
-        low_rank_kv=self.kvd(x)
+        low_rank_kv=self.kvd(x) #B,S,compressed_dim
         k=self.k_up_proj(low_rank_kv)
         kr=self.kr_proj(x).unsqueeze(2)
         kr=kr.expand(-1,-1,self.num_heads,-1).permute(0,2,1,3)
         kr=self.rope(kr)
-        k= k.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
+        k= k.reshape(B,N,self.num_heads,self.head_dim*3).permute(0,2,1,3)
         k=torch.cat((k,kr),dim=-1) #B,num_heads,seq_len,head_dim
         
         #values
         ### the point of doing low rank is not just parameter count reduction, but also kv cache size reduction
         v=self.v_up_proj(low_rank_kv) 
-        v=v.reshape(B,N,self.num_heads,(self.head_dim*2)).permute(0,2,1,3)
+        v=v.reshape(B,N,self.num_heads,(self.head_dim*4)).permute(0,2,1,3)
+
         
+        docs = (token_seq == 50256).cumsum(0)
+        def document_causal_mask(b, h, q_idx, kv_idx):
+          causal_mask = q_idx >= kv_idx
+          document_mask = docs[q_idx] == docs[kv_idx]
+          window_mask = q_idx - kv_idx < 1024
+          return causal_mask & document_mask & window_mask
+
+        S = len(token_seq)
+        block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
+
+        q=F.rms_norm(q, (q.size(-1),))
+        k=F.rms_norm(k, (k.size(-1),))
         x = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
         x = x.transpose(1, 2).reshape(B, N, -1)
 
         x=self.o_proj(x)
         return x
-
