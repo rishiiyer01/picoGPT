@@ -1,5 +1,6 @@
 # picoGPT
-taking some learnings from nanoGPT speedruns and applying experiments
+taking some learnings from nanoGPT speedruns and applying experiments for educational purposes
+The main purpose of this repo is NOT to speedrun, but instead do small 8xH100 sized experiments to both learn and alter recent research.
 
 
 Model.py/Train.py is a simple ~gpt2 sized language model with FlexAttention, Multi-latent Attention, 768 embed_dim, 12 layers, 12 heads
