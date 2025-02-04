@@ -1,5 +1,5 @@
 # picoGPT
-taking some learnings from nanoGPT speedruns and applying experiments for educational purposes
+Taking some learnings from nanoGPT speedruns and applying experiments for educational purposes.
 The main purpose of this repo is NOT to speedrun, but instead do small 8xH100 sized experiments to both learn and alter recent research.
 
 
