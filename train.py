@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-#I almost wanted to use FSDP with no_shard, but DDP is actually faster even though it is older
+
 from model import PicoGPT
 from torch.cuda.amp import autocast
 
