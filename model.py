@@ -269,7 +269,7 @@ class FeedForward(nn.Module):
 #theoretically because the qkv is low rank computed, it might be beneficial to use moes for each linear layer
 #for flex attention compiled, we need even lower rank for q and k
 class MultiLatentAttention(nn.Module):
-    def __init__(self,hidden_dim,num_heads=12,low_rank=4,block_size=128,max_seq_len=1024):
+    def __init__(self,hidden_dim,num_heads=12,low_rank=2,block_size=128,max_seq_len=1024):
         super().__init__()
         self.num_heads=num_heads
         self.head_dim=hidden_dim//num_heads
@@ -277,21 +277,21 @@ class MultiLatentAttention(nn.Module):
         self.max_seq_len=max_seq_len
         #assert hidden_dim//num_heads
         #downproj for q
-        self.qd_proj=nn.Linear(hidden_dim,hidden_dim//2) #for queries we only compress by factor of 2 instead of 4
-        self.qu_proj=nn.Linear(hidden_dim//2,hidden_dim*3)
+        self.qd_proj=nn.Linear(hidden_dim,hidden_dim//low_rank) 
+        self.qu_proj=nn.Linear(hidden_dim//low_rank,hidden_dim)
         #self.qr_proj=nn.Linear(hidden_dim,self.head_dim) #original
         self.qr_proj=nn.Linear(hidden_dim,self.head_dim)
         #shared downproj for k,v
         self.kvd=nn.Linear(hidden_dim,hidden_dim//low_rank)
-        self.v_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim*4)
-        self.k_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim*3)
+        self.v_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim*2)
+        self.k_up_proj=nn.Linear(hidden_dim//low_rank,hidden_dim)
         #self.kr_proj=nn.Linear(hidden_dim,self.head_dim) #original
         self.kr_proj=nn.Linear(hidden_dim,self.head_dim)
         #output proj
-        self.o_proj = nn.Linear(hidden_dim*4, hidden_dim)
+        self.o_proj = nn.Linear(hidden_dim*2, hidden_dim)
         #self.rope=RotaryPositionEmbedding(self.head_dim) #orignal
         self.rope=RotaryPositionEmbedding(self.head_dim)
-        self.scale = (4*self.head_dim) ** -0.5 #original was 2, now we are doing larger attention at 3/2
+        self.scale = (2*self.head_dim) ** -0.5 #original was 2, now we are doing larger attention at 3/2
         #self.scale=(self.head_dim)**-0.5
         
         self.world_size=torch.distributed.get_world_size()
@@ -312,7 +312,7 @@ class MultiLatentAttention(nn.Module):
         qr=qr.expand(-1,-1,self.num_heads,-1).permute(0,2,1,3) #B,num_heads,seq_len,head_dim//2
         qr=self.rope(qr)
         q=self.qu_proj(qd) #B,N,dim
-        q=q.reshape(B,N,self.num_heads,self.head_dim*3).permute(0,2,1,3)
+        q=q.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
         q=torch.cat((q,qr),dim=-1) #B,num_heads,seq_len,head_dim
         
         
@@ -322,13 +322,13 @@ class MultiLatentAttention(nn.Module):
         kr=self.kr_proj(x).unsqueeze(2)
         kr=kr.expand(-1,-1,self.num_heads,-1).permute(0,2,1,3)
         kr=self.rope(kr)
-        k= k.reshape(B,N,self.num_heads,self.head_dim*3).permute(0,2,1,3)
+        k= k.reshape(B,N,self.num_heads,self.head_dim).permute(0,2,1,3)
         k=torch.cat((k,kr),dim=-1) #B,num_heads,seq_len,head_dim
         
         #values
         ### the point of doing low rank is not just parameter count reduction, but also kv cache size reduction
         v=self.v_up_proj(low_rank_kv) 
-        v=v.reshape(B,N,self.num_heads,(self.head_dim*4)).permute(0,2,1,3)
+        v=v.reshape(B,N,self.num_heads,(self.head_dim*2)).permute(0,2,1,3)
 
         
         docs = (token_seq == 50256).cumsum(0)
@@ -341,8 +341,8 @@ class MultiLatentAttention(nn.Module):
         S = len(token_seq)
         block_mask = create_block_mask(document_causal_mask, None, None, S, S, device="cuda", _compile=True)
 
-        q=F.rms_norm(q, (q.size(-1),))
-        k=F.rms_norm(k, (k.size(-1),))
+        #q=F.rms_norm(q, (q.size(-1),))
+        #k=F.rms_norm(k, (k.size(-1),))
         x = flex_attention(q, k, v, block_mask=block_mask, scale=self.scale)
         x = x.transpose(1, 2).reshape(B, N, -1)
 
