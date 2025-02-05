@@ -10,3 +10,4 @@ Model.py/Train.py is a simple ~gpt2 sized language model with FlexAttention, Mul
 MoEmodel.py/MoEtrain.py is the same as above except with expert parallel MoEs replacing feedforwards (similar to deepseek v2,v3), 8 experts, topk=2
 
 Full writeup and blogpost of initial experiments:
+https://rishiiyer.com/writings/zeroth.html
